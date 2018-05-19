@@ -27,7 +27,7 @@ struct IndexNode
     struct FileNode* root;
     int32_t num_bitmap;//bitmap数组大小
     int32_t avail_block;//可用块数
-}*indexnode;
+}*indexnode;//索引结点
 
 static struct FileNode *get_FileNode(const char *name)
 {
@@ -46,15 +46,16 @@ int32_t get_idle_block()
 {
     int32_t free_mem = 0, num_bitmap_block = blocknr/(8*sizeof(int32_t));
     for(; (free_mem<num_bitmap_block)&&(bitmap[free_mem]==0xFFFFFFFF); free_mem++);
-    if (free_mem == num_bitmap_block)
+
+    if (free_mem == num_bitmap_block)//无空闲块
         return -ENOSPC;
-    
+
     return free_mem*32+__builtin_ctzll(~bitmap[free_mem]);
 }
 
 void free_mem(int32_t block)
 {
-	memset(mem[block], 0, blocksize);
+    memset(mem[block], 0, blocksize);
     munmap(mem[block], blocksize);
     indexnode->avail_block++;
     bitmap[block>>5] &= ~(1 << (block&0x1F));
@@ -72,8 +73,8 @@ static void create_FileNode(const char *filename, const struct stat *st)
     indexnode->root = new;
     indexnode->avail_block--;
     bitmap[num_newnode>>5] |= (1 << (num_newnode&0x1F));
-    
-    if (strcmp(filename, "/") != 0)
+
+    if (strcmp(filename, "/") != 0)//为文件创建一个数据块
     {
         int32_t block = get_idle_block();
         mem[block] = mmap(NULL, blocksize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -87,13 +88,13 @@ static void create_FileNode(const char *filename, const struct stat *st)
 
 static void *oshfs_init(struct fuse_conn_info *conn)
 {
-    //set indexnode
+    //设置索引结点
     mem[0] = mmap(NULL, blocksize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     memset(mem[0], 0, blocksize);
     indexnode = (struct IndexNode*)mem[0];
     indexnode->root = NULL;
-    
-    //set bitmap
+
+    //初始化bitmap数组
     indexnode->num_bitmap = blocknr/(8*sizeof(int32_t));
     int32_t num_bitmap_block = blocknr/(8*blocksize);
     mem[1] = mmap(NULL, blocksize*num_bitmap_block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -103,7 +104,7 @@ static void *oshfs_init(struct fuse_conn_info *conn)
     bitmap = (int32_t *)mem[1];
     for(int i=0; i<=num_bitmap_block; i++)
         bitmap[i>>5] |= (1<<(i&0x01F));
-    
+
     indexnode->avail_block = blocknr-num_bitmap_block-1;
     return NULL;
 }
@@ -147,11 +148,14 @@ static int oshfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
 static int oshfs_mknod(const char *path, mode_t mode, dev_t dev)
 {
     struct stat st;
+    time(&st.st_atime);
+    time(&st.st_mtime);
     st.st_mode = S_IFREG | 0644;
     st.st_uid = fuse_get_context()->uid;
     st.st_gid = fuse_get_context()->gid;
     st.st_nlink = 1;
     st.st_size = 0;
+    st.st_blksize = blocksize;
     create_FileNode(path + 1, &st);
     return 0;
 }
@@ -164,15 +168,18 @@ static int oshfs_open(const char *path, struct fuse_file_info *fi)
 static int oshfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     struct FileNode *node = get_FileNode(path);
+    if (node == NULL)
+        return -ENOENT;
+
     int need_block = (offset+size-1)/(blocksize-4)+1-node->num_block;
     if (need_block > indexnode->avail_block)
         return -ENOSPC;
     else node->st.st_size = offset + size;
-    
+
     int last_block = node->next_block;
     while (*((int*)mem[last_block]) != 0)
         last_block = *((int*)mem[last_block]);
-    while (need_block > 0)
+    while (need_block > 0)//将不够的块数补全
     {
         int32_t block = get_idle_block();
         mem[block] = mmap(NULL, blocksize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -184,12 +191,12 @@ static int oshfs_write(const char *path, const char *buf, size_t size, off_t off
         node->num_block++;
         need_block--;
     }
-    
-    
-    int skip_block = offset/(blocksize-4);//前四个字节存放下一块位置
-    int offset_block = offset%(blocksize-4);
-    int num_block = (offset_block+size-1)/(blocksize-4);
-    
+
+    //每个数据块前四个字节存放下一数据块位置
+    int skip_block = offset/(blocksize-4);//要跳过的块数
+    int offset_block = offset%(blocksize-4);//要写的位置的偏移量
+    int num_block = (offset_block+size-1)/(blocksize-4);//要写的块数
+
     int start_block = node->next_block;
     for (int i=0; i<skip_block; i++)
         start_block = *((int*)mem[start_block]);
@@ -197,16 +204,16 @@ static int oshfs_write(const char *path, const char *buf, size_t size, off_t off
         memcpy(mem[start_block]+4+offset_block, buf, size);
     else
     {
-        int block = start_block;
+        int block = start_block, num = num_block;
         const char *wbuf = buf;
-        while(block != 0)
+        while(num >= 0)
         {
-            if (block == start_block)
+            if (num == num_block)
             {
                 memcpy(mem[block]+4+offset_block, wbuf, blocksize-4-offset_block);
                 wbuf += blocksize-4-offset_block;
             }
-            else if (*((int*)mem[block]) != 0)
+            else if (num > 0)
             {
                 memcpy(mem[block]+4, wbuf, blocksize-4);
                 wbuf += blocksize-4;
@@ -216,22 +223,27 @@ static int oshfs_write(const char *path, const char *buf, size_t size, off_t off
                 memcpy(mem[block]+4, wbuf, size-(int64_t)(wbuf-buf));
             }
             block = *((int*)mem[block]);
+            num--;
         }
     }
-    
+
     return size;
 }
 
 static int oshfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     struct FileNode *node = get_FileNode(path);
+    if (node == NULL)
+        return -ENOENT;
+
     int64_t ret = size;
     if(offset + size > node->st.st_size)
         ret = (node->st.st_size - offset);
-    int skip_block = offset / (blocksize-4);//每块用四个字节存放下一个块的位置
+    //每个数据块前四个字节存放下一数据块位置
+    int skip_block = offset / (blocksize-4);
     int offset_block = offset % (blocksize-4);
     int num_block = (offset_block+ret-1) / (blocksize-4);
-    
+
     int start_block = node->next_block;
     for (int i=0; i<skip_block; i++)
         start_block = *((int*)mem[start_block]);
@@ -257,8 +269,7 @@ static int oshfs_read(const char *path, char *buf, size_t size, off_t offset, st
             else
                 memcpy(rbuf, mem[block]+4, ret-(int64_t)(rbuf-buf));
             block = *((int*)mem[block]);
-			num--;
-
+            num--;
         }
     }
     return ret;
@@ -267,6 +278,9 @@ static int oshfs_read(const char *path, char *buf, size_t size, off_t offset, st
 static int oshfs_unlink(const char *path)
 {
     struct FileNode *node = get_FileNode(path), *root = indexnode->root;
+    if (node == NULL)
+        return -ENOENT;
+
     int start_block = node->next_block, block = node->next_block;
     while (block != 0)
     {
@@ -275,18 +289,18 @@ static int oshfs_unlink(const char *path)
         start_block = block;
     }
     if (root == node)
-	{
-		root = root->next;
-		indexnode->root = root;
-	}
-	else if (node)
-	{
-    	while ((root->next) != node)
-			root = root->next;
+    {
+        root = root->next;
+        indexnode->root = root;
+    }
+    else if (node)
+    {
+        while ((root->next) != node)
+            root = root->next;
         root->next = node->next;
-	}
+    }
 
-	for (block=0; mem[block]!=(void*)node; block++);
+    for (block=0; mem[block]!=(void*)node; block++);
     free_mem(block);
     return 0;
 }
@@ -294,16 +308,19 @@ static int oshfs_unlink(const char *path)
 static int oshfs_truncate(const char *path, off_t size)
 {
     struct FileNode *node = get_FileNode(path);
+    if (node == NULL)
+        return -ENOENT;
+
     int remain_block = (size-1) / blocksize + 1;
     if (size == 0) remain_block = 1;
-    
+
     int start_block = node->next_block;
     while (remain_block > 1)
     {
         start_block = *((int*)mem[start_block]);
         remain_block--;
     }
-    
+
     int block = *((int*)mem[start_block]);
     *((int*)mem[start_block]) = 0;
     start_block = block;
@@ -313,8 +330,39 @@ static int oshfs_truncate(const char *path, off_t size)
         free_mem(start_block);
         start_block = block;
     }
-    
+
     node->st.st_size = size;
+    return 0;
+}
+
+static int oshfs_chmod(const char * path, mode_t mode)
+{
+    struct FileNode *node = get_FileNode(path);
+    if (node == NULL)
+        return -ENOENT;
+
+    node->st.st_mode = mode;
+    return 0;
+}
+
+static int oshfs_chown(const char * path, uid_t uid, gid_t gid)
+{
+    struct FileNode *node = get_FileNode(path);
+    if (node == NULL)
+        return -ENOENT;
+
+    node->st.st_uid = uid;
+    node->st.st_gid = gid;
+    return 0;
+}
+
+static int oshfs_utimens(const char * path, const struct timespec tv[2])
+{
+    struct FileNode *node = get_FileNode(path);
+    if (node == NULL)
+        return -ENOENT;
+
+    node->st.st_atime = node->st.st_mtime = tv->tv_sec;
     return 0;
 }
 
@@ -329,6 +377,9 @@ static const struct fuse_operations op =
     .truncate = oshfs_truncate,
     .read = oshfs_read,
     .unlink = oshfs_unlink,
+    .chmod = oshfs_chmod,
+    .chown = oshfs_chown,
+    .utimens = oshfs_utimens,
 };
 
 int main(int argc, char *argv[])
